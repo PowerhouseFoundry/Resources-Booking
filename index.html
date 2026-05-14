@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Powerhouse Resource Booking</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%237f4b8b'/%3E%3Ccircle cx='70' cy='30' r='25' fill='%23a6ce39'/%3E%3Ctext x='50' y='60' font-size='38' text-anchor='middle' fill='white' font-family='Arial' font-weight='700'%3EPH%3C/text%3E%3C/svg%3E">
   <style>
     :root {
       --purple:#7f4b8b;
@@ -697,6 +698,18 @@
       }
     }
 
+  
+    .block .mini-btn {
+      margin-right:4px;
+      margin-bottom:2px;
+      border:1px solid rgba(0,0,0,.15);
+    }
+
+    .block.booked .mini-btn {
+      background:#ffffff;
+      color:#182230;
+    }
+
   </style>
 </head>
 <body>
@@ -856,13 +869,25 @@
   <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
 
   <script>
+    window.addEventListener("error", function(event) {
+      const box = document.getElementById("appError");
+      if (box) {
+        box.style.display = "block";
+        box.textContent = "App error: " + event.message + ". If this says import statement outside a module, remove Firebase import lines and paste only the firebaseConfig object.";
+      }
+    });
+
     const ADMIN_PASSWORD = "3267";
 
     /*
       FIREBASE SETUP
       1. Create a Firebase project.
       2. Add a Web App.
-      3. Copy your Firebase config and paste it below.
+      3. Copy your Firebase config and paste ONLY the firebaseConfig object below.
+         Do NOT paste Firebase lines that start with:
+         import { initializeApp } from "firebase/app";
+         import { getFirestore } from "firebase/firestore";
+         This file uses browser script tags, not npm/module imports.
       4. Create a Firestore Database.
       5. Upload/host this HTML file.
 
@@ -878,9 +903,7 @@
 
       For real use, replace those test rules with authenticated staff-only rules.
     */
-
-// Your web app's Firebase configuration
-const firebaseConfig = {
+    const firebaseConfig = {
   apiKey: "AIzaSyCUXgzNA8rBvvP6_D9K5BsHKBD_szak8mc",
   authDomain: "resources-booking-d3579.firebaseapp.com",
   projectId: "resources-booking-d3579",
@@ -889,9 +912,13 @@ const firebaseConfig = {
   appId: "1:824972362234:web:fb51ac7254ab18d3816443"
 };
 
-
-
     const FIRESTORE_DOC_PATH = "powerhouseResourceBooking/main";
+
+    /*
+      If the timetable is blank after editing this file, check the browser Console.
+      The error "Cannot use import statement outside a module" means the Firebase npm/module snippet was pasted in.
+      Remove any lines beginning with "import" and paste only the firebaseConfig object values.
+    */
     let db = null;
     let firebaseReady = false;
     let applyingRemoteUpdate = false;
@@ -1007,6 +1034,11 @@ const firebaseConfig = {
       }
 
       try {
+        if (typeof firebase === "undefined") {
+          setFirebaseStatus("Firebase SDK not loaded", "error");
+          return;
+        }
+
         firebase.initializeApp(firebaseConfig);
         db = firebase.firestore();
         firebaseReady = true;
@@ -1101,9 +1133,9 @@ const firebaseConfig = {
     }
 
     function getResources() {
-      const all = state.resources[currentType];
+      const all = state.resources[currentType] || [];
       if (singleResource && all.includes(singleResource)) return [singleResource];
-      return all;
+      return all.length ? all : (currentType === "vehicles" ? ["Vehicle 1"] : ["Room 1"]);
     }
 
     function getAllResourcesForCurrentType() {
@@ -1274,6 +1306,32 @@ const firebaseConfig = {
       });
     }
 
+
+    function removeBookingById(id) {
+      const booking = state.bookings.find(item => item.id === id);
+      if (!booking) return;
+
+      const message = booking.repeatWeekly
+        ? "Remove the whole weekly booking series?"
+        : "Cancel this booking?";
+
+      if (!confirm(message)) return;
+
+      state.bookings = state.bookings.filter(item => item.id !== id);
+      saveState();
+      render();
+    }
+
+    function removeLockById(id) {
+      const lock = state.locks.find(item => item.id === id);
+      if (!lock) return;
+      if (!confirm("Remove this unavailable block?")) return;
+
+      state.locks = state.locks.filter(item => item.id !== id);
+      saveState();
+      render();
+    }
+
     function makeBlock(item, type) {
       const block = document.createElement("div");
       const startIndex = slotIndex(item.start);
@@ -1310,28 +1368,45 @@ const firebaseConfig = {
           cancelToday.type = "button";
           cancelToday.className = "mini-btn";
           cancelToday.textContent = "Cancel today";
+          cancelToday.title = "Cancel only this date. The weekly booking remains.";
           cancelToday.onclick = event => {
             event.stopPropagation();
             cancelRecurringOccurrence(item.id, item.occurrenceDate);
           };
           block.appendChild(cancelToday);
+
+          const removeSeries = document.createElement("button");
+          removeSeries.type = "button";
+          removeSeries.className = "mini-btn";
+          removeSeries.textContent = "Remove series";
+          removeSeries.title = "Remove the whole weekly booking.";
+          removeSeries.onclick = event => {
+            event.stopPropagation();
+            removeBookingById(item.id);
+          };
+          block.appendChild(removeSeries);
+        } else {
+          const cancelBooking = document.createElement("button");
+          cancelBooking.type = "button";
+          cancelBooking.className = "mini-btn";
+          cancelBooking.textContent = "Cancel booking";
+          cancelBooking.title = "Remove this booking.";
+          cancelBooking.onclick = event => {
+            event.stopPropagation();
+            removeBookingById(item.id);
+          };
+          block.appendChild(cancelBooking);
         }
       }
 
-      if (adminMode) {
+      if (adminMode && type === "locked") {
         const btn = document.createElement("button");
         btn.type = "button";
         btn.className = "mini-btn";
-        btn.textContent = type === "booked" && item.repeatWeekly ? "Remove series" : "Remove";
+        btn.textContent = "Remove block";
         btn.onclick = event => {
           event.stopPropagation();
-          if (type === "booked") {
-            state.bookings = state.bookings.filter(booking => booking.id !== item.id);
-          } else {
-            state.locks = state.locks.filter(lock => lock.id !== item.id);
-          }
-          saveState();
-          render();
+          removeLockById(item.id);
         };
         block.appendChild(btn);
       }
@@ -1710,5 +1785,8 @@ const firebaseConfig = {
     initialiseFirebase();
     render();
   </script>
+
+    <div id="appError" style="display:none;position:fixed;left:10px;right:10px;bottom:10px;z-index:9999;background:#fff1f0;border:2px solid #f04438;color:#7a271a;border-radius:12px;padding:10px;font-family:Arial;font-size:14px;font-weight:700;"></div>
+
 </body>
 </html>

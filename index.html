@@ -231,7 +231,7 @@
 
     .resource-header {
       display:grid;
-      grid-template-columns:var(--timecol) repeat(var(--resource-count), minmax(150px,1fr));
+      grid-template-columns:var(--timecol) repeat(var(--resource-count), minmax(112px,1fr));
       overflow:hidden;
       border-bottom:1px solid var(--line);
       background:#fbfcfd;
@@ -262,7 +262,7 @@
 
     .calendar-body {
       display:grid;
-      grid-template-columns:var(--timecol) repeat(var(--resource-count), minmax(150px,1fr));
+      grid-template-columns:var(--timecol) repeat(var(--resource-count), minmax(112px,1fr));
       min-height:calc(16 * var(--slot));
     }
 
@@ -577,7 +577,7 @@
 
       .resource-header,
       .calendar-body {
-        grid-template-columns:var(--timecol) repeat(var(--resource-count), minmax(132px,1fr));
+        grid-template-columns:var(--timecol) repeat(var(--resource-count), minmax(96px,1fr));
       }
 
       .time-head, .res-head {
@@ -708,6 +708,40 @@
     .block.booked .mini-btn {
       background:#ffffff;
       color:#182230;
+    }
+
+  
+    .resource-header {
+      overflow-x:auto;
+      overflow-y:hidden;
+      scrollbar-width:none;
+      -ms-overflow-style:none;
+    }
+
+    .resource-header::-webkit-scrollbar {
+      display:none;
+    }
+
+    .calendar-body {
+      min-width:100%;
+    }
+
+    @media (max-width:700px) {
+      .res-head {
+        font-size:.66rem;
+        line-height:1.05;
+        word-break:break-word;
+      }
+
+      .block-title {
+        font-size:.68rem;
+      }
+
+      .block-time,
+      .block-note,
+      .cancelled-note {
+        font-size:.62rem;
+      }
     }
 
   </style>
@@ -1244,6 +1278,23 @@
       if (adminMode) renderAdminLists();
     }
 
+
+    function syncHeaderScroll() {
+      const scroll = document.getElementById("calendarScroll");
+      const header = document.getElementById("resourceHeader");
+      if (!scroll || !header || header.dataset.synced === "true") return;
+
+      header.dataset.synced = "true";
+
+      scroll.addEventListener("scroll", () => {
+        header.scrollLeft = scroll.scrollLeft;
+      });
+
+      header.addEventListener("scroll", () => {
+        scroll.scrollLeft = header.scrollLeft;
+      });
+    }
+
     function renderCalendar() {
       const resources = getResources();
       const header = document.getElementById("resourceHeader");
@@ -1304,6 +1355,8 @@
 
         body.appendChild(column);
       });
+
+      syncHeaderScroll();
     }
 
 

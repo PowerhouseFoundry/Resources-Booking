@@ -744,6 +744,23 @@
       }
     }
 
+  
+    .block.booked {
+      cursor:pointer;
+    }
+
+    .block.booked:hover {
+      filter:brightness(1.06);
+      outline:2px solid rgba(166,206,57,.8);
+    }
+
+    .block .block-click-hint {
+      font-size:.64rem;
+      font-weight:900;
+      margin-top:2px;
+      opacity:.9;
+    }
+
   </style>
 </head>
 <body>
@@ -842,7 +859,11 @@
           <input id="bookingRepeatUntil" type="date">
         </div>
 
-        <button type="button" class="btn btn-primary btn-full" onclick="saveBooking()">Book resource</button>
+        <button type="button" id="bookingSaveBtn" class="btn btn-primary btn-full" onclick="saveBooking()">Book resource</button>
+        <div id="editActions" style="display:none; margin-top:8px;">
+          <button type="button" id="cancelTodayBtn" class="btn btn-purple btn-full" style="display:none; margin-bottom:8px;" onclick="cancelEditingOccurrence()">Cancel this day only</button>
+          <button type="button" class="btn btn-danger btn-full" onclick="discardEditingBooking()">Discard booking</button>
+        </div>
         <div id="bookingMessage" class="message"></div>
       </div>
     </div>
@@ -976,6 +997,8 @@
     let selectedStart = "08:00";
     let selectedEnd = "08:30";
     let adminMode = false;
+    let editingBookingId = "";
+    let editingOccurrenceDate = "";
 
     function makeResourceHash(type, resourceName) {
       if (!resourceName) return "#" + type;
@@ -1203,19 +1226,23 @@
       return slotIndex(startA) < slotIndex(endB) && slotIndex(endA) > slotIndex(startB);
     }
 
-    function hasConflict(resource, start, end) {
-      return hasConflictOnDate(resource, start, end, dateKey(selectedDate));
+    function hasConflict(resource, start, end, excludeId = "") {
+      return hasConflictOnDate(resource, start, end, dateKey(selectedDate), excludeId);
     }
 
-    function hasConflictOnDate(resource, start, end, key) {
+    function hasConflictOnDate(resource, start, end, key, excludeId = "") {
       const items = itemsForDate(state.bookings, key).concat(itemsForDate(state.locks, key));
-      return items.some(item => item.resource === resource && overlaps(start, end, item.start, item.end));
+      return items.some(item =>
+        item.id !== excludeId &&
+        item.resource === resource &&
+        overlaps(start, end, item.start, item.end)
+      );
     }
 
-    function hasWeeklyConflict(resource, start, end, firstKey, repeatUntil) {
+    function hasWeeklyConflict(resource, start, end, firstKey, repeatUntil, excludeId = "") {
       let key = firstKey;
       while (key <= repeatUntil) {
-        if (hasConflictOnDate(resource, start, end, key)) return key;
+        if (hasConflictOnDate(resource, start, end, key, excludeId)) return key;
         key = addDaysToKey(key, 7);
       }
       return "";
@@ -1416,40 +1443,17 @@
           repeat.className = "cancelled-note";
           repeat.textContent = "Weekly until " + item.repeatUntil;
           block.appendChild(repeat);
-
-          const cancelToday = document.createElement("button");
-          cancelToday.type = "button";
-          cancelToday.className = "mini-btn";
-          cancelToday.textContent = "Cancel today";
-          cancelToday.title = "Cancel only this date. The weekly booking remains.";
-          cancelToday.onclick = event => {
-            event.stopPropagation();
-            cancelRecurringOccurrence(item.id, item.occurrenceDate);
-          };
-          block.appendChild(cancelToday);
-
-          const removeSeries = document.createElement("button");
-          removeSeries.type = "button";
-          removeSeries.className = "mini-btn";
-          removeSeries.textContent = "Remove series";
-          removeSeries.title = "Remove the whole weekly booking.";
-          removeSeries.onclick = event => {
-            event.stopPropagation();
-            removeBookingById(item.id);
-          };
-          block.appendChild(removeSeries);
-        } else {
-          const cancelBooking = document.createElement("button");
-          cancelBooking.type = "button";
-          cancelBooking.className = "mini-btn";
-          cancelBooking.textContent = "Cancel booking";
-          cancelBooking.title = "Remove this booking.";
-          cancelBooking.onclick = event => {
-            event.stopPropagation();
-            removeBookingById(item.id);
-          };
-          block.appendChild(cancelBooking);
         }
+
+        const hint = document.createElement("div");
+        hint.className = "block-click-hint";
+        hint.textContent = "Tap to edit";
+        block.appendChild(hint);
+
+        block.onclick = event => {
+          event.stopPropagation();
+          openEditBookingModal(item);
+        };
       }
 
       if (adminMode && type === "locked") {
@@ -1467,11 +1471,7 @@
       return block;
     }
 
-    function openBookingModal() {
-      document.getElementById("bookingModal").classList.add("show");
-      document.getElementById("bookingModalTitle").textContent = currentType === "rooms" ? "New room booking" : "New vehicle booking";
-      document.getElementById("bookingDate").value = dateKey(selectedDate);
-
+    function prepareBookingModalOptions() {
       const resourceSelect = document.getElementById("bookingResource");
       resourceSelect.innerHTML = "";
       getResources().forEach(resource => {
@@ -1480,7 +1480,6 @@
         option.textContent = resource;
         resourceSelect.appendChild(option);
       });
-      resourceSelect.value = selectedResource;
 
       const startSelect = document.getElementById("bookingStart");
       startSelect.innerHTML = "";
@@ -1490,18 +1489,77 @@
         option.textContent = time;
         startSelect.appendChild(option);
       });
-      startSelect.value = selectedStart;
+    }
+
+    function setModalMode(mode, booking = null) {
+      const isEdit = mode === "edit";
+      document.getElementById("bookingModalTitle").textContent = isEdit
+        ? "Edit booking"
+        : (currentType === "rooms" ? "New room booking" : "New vehicle booking");
+
+      document.getElementById("bookingSaveBtn").textContent = isEdit ? "Update booking" : "Book resource";
+      document.getElementById("editActions").style.display = isEdit ? "block" : "none";
+
+      const cancelTodayBtn = document.getElementById("cancelTodayBtn");
+      cancelTodayBtn.style.display = isEdit && booking && booking.repeatWeekly ? "block" : "none";
+    }
+
+    function openBookingModal() {
+      editingBookingId = "";
+      editingOccurrenceDate = "";
+
+      document.getElementById("bookingModal").classList.add("show");
+      prepareBookingModalOptions();
+      setModalMode("new");
+
+      document.getElementById("bookingDate").value = dateKey(selectedDate);
+      document.getElementById("bookingResource").value = selectedResource;
+      document.getElementById("bookingStart").value = selectedStart;
       refreshBookingEndOptions();
       document.getElementById("bookingEnd").value = selectedEnd;
+
+      document.getElementById("bookingStaff").value = "";
+      document.getElementById("bookingPurpose").value = "";
       document.getElementById("bookingRepeatWeekly").checked = false;
       document.getElementById("repeatEndWrap").style.display = "none";
       document.getElementById("bookingRepeatUntil").value = "";
       clearBookingMessage();
+
       setTimeout(() => document.getElementById("bookingStaff").focus(), 50);
+    }
+
+    function openEditBookingModal(item) {
+      editingBookingId = item.id;
+      editingOccurrenceDate = item.occurrenceDate || dateKey(selectedDate);
+
+      selectedDate = dateFromKey(editingOccurrenceDate);
+      selectedResource = item.resource;
+      selectedStart = item.start;
+      selectedEnd = item.end;
+
+      document.getElementById("bookingModal").classList.add("show");
+      prepareBookingModalOptions();
+      setModalMode("edit", item);
+
+      document.getElementById("bookingDate").value = editingOccurrenceDate;
+      document.getElementById("bookingResource").value = item.resource;
+      document.getElementById("bookingStart").value = item.start;
+      refreshBookingEndOptions();
+      document.getElementById("bookingEnd").value = item.end;
+      document.getElementById("bookingStaff").value = item.staff || "";
+      document.getElementById("bookingPurpose").value = item.purpose || "";
+
+      document.getElementById("bookingRepeatWeekly").checked = !!item.repeatWeekly;
+      document.getElementById("repeatEndWrap").style.display = item.repeatWeekly ? "grid" : "none";
+      document.getElementById("bookingRepeatUntil").value = item.repeatUntil || "";
+      clearBookingMessage();
+      render();
     }
 
     function closeBookingModal() {
       document.getElementById("bookingModal").classList.remove("show");
+      editingBookingId = "";
+      editingOccurrenceDate = "";
     }
 
     function setDateFromBookingModal() {
@@ -1555,6 +1613,8 @@
     }
 
     function saveBooking() {
+      if (editingBookingId) return updateExistingBooking();
+
       const resource = document.getElementById("bookingResource").value;
       const start = document.getElementById("bookingStart").value;
       const end = document.getElementById("bookingEnd").value;
@@ -1595,6 +1655,76 @@
       document.getElementById("bookingPurpose").value = "";
       closeBookingModal();
       render();
+    }
+
+    function updateExistingBooking() {
+      const booking = state.bookings.find(item => item.id === editingBookingId);
+      if (!booking) return showBookingMessage("Booking not found. Please refresh and try again.", true);
+
+      const resource = document.getElementById("bookingResource").value;
+      const start = document.getElementById("bookingStart").value;
+      const end = document.getElementById("bookingEnd").value;
+      const staff = document.getElementById("bookingStaff").value.trim();
+      const purpose = document.getElementById("bookingPurpose").value.trim();
+      const repeatWeekly = document.getElementById("bookingRepeatWeekly").checked;
+      const repeatUntil = document.getElementById("bookingRepeatUntil").value;
+      const firstKey = document.getElementById("bookingDate").value || dateKey(selectedDate);
+
+      if (!staff) return showBookingMessage("Please enter a staff name.", true);
+
+      if (repeatWeekly) {
+        if (!repeatUntil) return showBookingMessage("Choose an end date for the weekly booking.", true);
+        if (repeatUntil < firstKey) return showBookingMessage("The end date must be after the first booking date.", true);
+
+        const conflictDate = hasWeeklyConflict(resource, start, end, firstKey, repeatUntil, editingBookingId);
+        if (conflictDate) return showBookingMessage("This booking clashes on " + conflictDate + ".", true);
+      } else {
+        if (hasConflictOnDate(resource, start, end, firstKey, editingBookingId)) {
+          return showBookingMessage("That time is already booked or unavailable.", true);
+        }
+      }
+
+      booking.resource = resource;
+      booking.date = firstKey;
+      booking.start = start;
+      booking.end = end;
+      booking.staff = staff;
+      booking.purpose = purpose || "Booked";
+      booking.repeatWeekly = repeatWeekly;
+      booking.repeatUntil = repeatWeekly ? repeatUntil : "";
+      if (!booking.cancelledDates) booking.cancelledDates = [];
+
+      selectedDate = dateFromKey(firstKey);
+      selectedResource = resource;
+      selectedStart = start;
+      selectedEnd = end;
+
+      saveState();
+      closeBookingModal();
+      render();
+    }
+
+    function discardEditingBooking() {
+      if (!editingBookingId) return;
+      const booking = state.bookings.find(item => item.id === editingBookingId);
+      if (!booking) return;
+
+      const message = booking.repeatWeekly
+        ? "Discard the whole weekly booking series?"
+        : "Discard this booking?";
+
+      if (!confirm(message)) return;
+
+      state.bookings = state.bookings.filter(item => item.id !== editingBookingId);
+      saveState();
+      closeBookingModal();
+      render();
+    }
+
+    function cancelEditingOccurrence() {
+      if (!editingBookingId || !editingOccurrenceDate) return;
+      cancelRecurringOccurrence(editingBookingId, editingOccurrenceDate);
+      closeBookingModal();
     }
 
     function cancelRecurringOccurrence(id, occurrenceDate) {

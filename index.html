@@ -1076,22 +1076,32 @@
       return JSON.parse(JSON.stringify(data));
     }
 
-    // Compare against the state from immediately before this local action.
-    // Only changed entries are applied to the latest SERVER state in a transaction.
-    // This prevents a stale browser from replacing all other people's bookings.
+    // Older saved bookings may not have an ID. Match them by their exact
+    // contents and duplicate occurrence, not their array position: removing
+    // an earlier entry must never make later entries look like new bookings.
+    function itemKey(item, index, list) {
+      if (item && item.id != null && item.id !== "") return "id:" + String(item.id);
+      const signature = JSON.stringify(item);
+      let occurrence = 0;
+      for (let i = 0; i < index; i++) {
+        if ((list[i].id == null || list[i].id === "") && JSON.stringify(list[i]) === signature) occurrence++;
+      }
+      return "legacy:" + signature + ":" + occurrence;
+    }
+
     function makeChanges(before, after) {
       const changes = { bookings: [], locks: [], resources: {} };
       for (const field of ["bookings", "locks"]) {
-        const oldItems = new Map(before[field].map(item => [item.id, item]));
-        const newItems = new Map(after[field].map(item => [item.id, item]));
-        for (const [id, oldItem] of oldItems) {
-          if (!newItems.has(id)) changes[field].push({ id, before: oldItem, after: null });
-          else if (JSON.stringify(oldItem) !== JSON.stringify(newItems.get(id))) {
-            changes[field].push({ id, before: oldItem, after: newItems.get(id) });
+        const oldItems = new Map(before[field].map((item, index) => [itemKey(item, index, before[field]), item]));
+        const newItems = new Map(after[field].map((item, index) => [itemKey(item, index, after[field]), item]));
+        for (const [key, oldItem] of oldItems) {
+          if (!newItems.has(key)) changes[field].push({ key, before: oldItem, after: null });
+          else if (JSON.stringify(oldItem) !== JSON.stringify(newItems.get(key))) {
+            changes[field].push({ key, before: oldItem, after: newItems.get(key) });
           }
         }
-        for (const [id, item] of newItems) {
-          if (!oldItems.has(id)) changes[field].push({ id, before: null, after: item });
+        for (const [key, item] of newItems) {
+          if (!oldItems.has(key)) changes[field].push({ key, before: null, after: item });
         }
       }
       for (const type of ["rooms", "vehicles"]) {
@@ -1113,7 +1123,7 @@
       while (day <= last && iterations++ < 520) {
         if (occursOnDate(item, day)) {
           const all = remote.bookings.concat(remote.locks);
-          if (all.some(other => other.id !== exceptId && other.type === item.type &&
+          if (all.some(other => (exceptId == null || other.id !== exceptId) && other.type === item.type &&
               other.resource === item.resource && occursOnDate(other, day) &&
               overlaps(item.start, item.end, other.start, other.end))) return true;
         }
@@ -1135,28 +1145,36 @@
         next.resources[type] = copyState(change.after);
       }
       for (const field of ["bookings", "locks"]) {
+        // Keep original legacy identities stable as preceding items are removed.
+        const keys = next[field].map((item, i, arr) => itemKey(item, i, arr));
         for (const change of changes[field]) {
-          const index = next[field].findIndex(item => item.id === change.id);
+          const index = keys.indexOf(change.key);
           const live = index < 0 ? null : next[field][index];
           if (!isSame(live, change.before)) {
             throw new Error("This booking or blocked time was changed on another device. Please try again.");
           }
           if (change.after && field === "bookings") {
             const withoutThis = copyState(next);
-            withoutThis.bookings = withoutThis.bookings.filter(item => item.id !== change.id);
-            if (proposedBookingClashes(change.after, withoutThis, change.id)) {
+            withoutThis.bookings = withoutThis.bookings.filter((item, i, arr) => itemKey(item, i, arr) !== change.key);
+            if (proposedBookingClashes(change.after, withoutThis, change.after.id)) {
               throw new Error("This time has just been booked on another device. Please select another slot.");
             }
           }
           if (change.after && field === "locks") {
             const withoutThis = copyState(next);
-            withoutThis.locks = withoutThis.locks.filter(item => item.id !== change.id);
-            if (proposedBookingClashes(change.after, withoutThis, change.id)) {
+            withoutThis.locks = withoutThis.locks.filter((item, i, arr) => itemKey(item, i, arr) !== change.key);
+            if (proposedBookingClashes(change.after, withoutThis, change.after.id)) {
               throw new Error("This time is already booked or blocked on another device.");
             }
           }
-          if (index >= 0) next[field].splice(index, 1);
-          if (change.after) next[field].push(copyState(change.after));
+          if (index >= 0) {
+            next[field].splice(index, 1);
+            keys.splice(index, 1);
+          }
+          if (change.after) {
+            next[field].push(copyState(change.after));
+            keys.push(change.key);
+          }
         }
       }
       return next;
@@ -1173,6 +1191,10 @@
       if (!firebaseReady || !firebaseLoaded || !db) {
         setFirebaseStatus("Not connected - changes disabled", "error");
         alert("Firebase is not connected. Your changes were not saved. Please refresh when online.");
+        return;
+      }
+      if (pendingWrites > 0) {
+        alert("A previous change is still being saved. Please wait for Firebase to finish and try again.");
         return;
       }
       const before = copyState(lastQueuedState);
@@ -1236,8 +1258,10 @@
     }
 
     function requireFirebase() {
-      if (firebaseReady && firebaseLoaded && db) return true;
-      alert("Bookings are temporarily read-only while Firebase connects or after a save error. Please refresh and try again.");
+      if (firebaseReady && firebaseLoaded && db && pendingWrites === 0) return true;
+      alert(pendingWrites > 0
+        ? "A change is still being saved. Please wait until Firebase is synced before making another change."
+        : "Bookings are temporarily read-only while Firebase connects or after a save error. Please refresh and try again.");
       return false;
     }
 

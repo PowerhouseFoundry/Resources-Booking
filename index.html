@@ -978,6 +978,13 @@
     let firebaseReady = false;
     let applyingRemoteUpdate = false;
     let unsubscribeRemote = null;
+    let firebaseLoaded = false;
+    let lastQueuedState = null;
+    let pendingWrites = 0;
+    let saveQueue = Promise.resolve();
+    const LOCAL_KEY = "powerhouseResourceBookingV15";
+    const HISTORY_PREFIX = "backup_";
+
     const SLOT_HEIGHT = 54;
 
     const defaultState = {
@@ -1065,73 +1072,223 @@
       };
     }
 
-    async function saveState() {
-      localStorage.setItem("powerhouseResourceBookingV15", JSON.stringify(state));
+    function copyState(data) {
+      return JSON.parse(JSON.stringify(data));
+    }
 
-      if (!firebaseReady || !db || applyingRemoteUpdate) return;
-
-      try {
-        await db.doc(FIRESTORE_DOC_PATH).set({
-          resources: state.resources,
-          bookings: state.bookings,
-          locks: state.locks,
-          updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-        setFirebaseStatus("Firebase synced", "online");
-      } catch (error) {
-        console.error("Firebase save failed:", error);
-        setFirebaseStatus("Firebase save error", "error");
+    // Compare against the state from immediately before this local action.
+    // Only changed entries are applied to the latest SERVER state in a transaction.
+    // This prevents a stale browser from replacing all other people's bookings.
+    function makeChanges(before, after) {
+      const changes = { bookings: [], locks: [], resources: {} };
+      for (const field of ["bookings", "locks"]) {
+        const oldItems = new Map(before[field].map(item => [item.id, item]));
+        const newItems = new Map(after[field].map(item => [item.id, item]));
+        for (const [id, oldItem] of oldItems) {
+          if (!newItems.has(id)) changes[field].push({ id, before: oldItem, after: null });
+          else if (JSON.stringify(oldItem) !== JSON.stringify(newItems.get(id))) {
+            changes[field].push({ id, before: oldItem, after: newItems.get(id) });
+          }
+        }
+        for (const [id, item] of newItems) {
+          if (!oldItems.has(id)) changes[field].push({ id, before: null, after: item });
+        }
       }
+      for (const type of ["rooms", "vehicles"]) {
+        if (JSON.stringify(before.resources[type]) !== JSON.stringify(after.resources[type])) {
+          changes.resources[type] = { before: before.resources[type], after: after.resources[type] };
+        }
+      }
+      return changes;
+    }
+
+    function isSame(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+
+    function proposedBookingClashes(item, remote, exceptId) {
+      if (!item || !item.resource || !item.start || !item.end || !item.date) return false;
+      // Weekly bookings have the same day of week; look across the proposed series.
+      let day = item.date;
+      const last = item.repeatWeekly ? (item.repeatUntil || addDaysToKey(day, 364)) : day;
+      let iterations = 0;
+      while (day <= last && iterations++ < 520) {
+        if (occursOnDate(item, day)) {
+          const all = remote.bookings.concat(remote.locks);
+          if (all.some(other => other.id !== exceptId && other.type === item.type &&
+              other.resource === item.resource && occursOnDate(other, day) &&
+              overlaps(item.start, item.end, other.start, other.end))) return true;
+        }
+        if (!item.repeatWeekly) break;
+        day = addDaysToKey(day, 7);
+      }
+      return false;
+    }
+
+    function applyCheckedChanges(remote, changes) {
+      const next = copyState(remote);
+      for (const type of ["rooms", "vehicles"]) {
+        const change = changes.resources[type];
+        if (!change) continue;
+        // Check that the list has not been independently edited on another device.
+        if (!isSame(next.resources[type], change.before)) {
+          throw new Error("The " + type + " list changed on another device. Please try again.");
+        }
+        next.resources[type] = copyState(change.after);
+      }
+      for (const field of ["bookings", "locks"]) {
+        for (const change of changes[field]) {
+          const index = next[field].findIndex(item => item.id === change.id);
+          const live = index < 0 ? null : next[field][index];
+          if (!isSame(live, change.before)) {
+            throw new Error("This booking or blocked time was changed on another device. Please try again.");
+          }
+          if (change.after && field === "bookings") {
+            const withoutThis = copyState(next);
+            withoutThis.bookings = withoutThis.bookings.filter(item => item.id !== change.id);
+            if (proposedBookingClashes(change.after, withoutThis, change.id)) {
+              throw new Error("This time has just been booked on another device. Please select another slot.");
+            }
+          }
+          if (change.after && field === "locks") {
+            const withoutThis = copyState(next);
+            withoutThis.locks = withoutThis.locks.filter(item => item.id !== change.id);
+            if (proposedBookingClashes(change.after, withoutThis, change.id)) {
+              throw new Error("This time is already booked or blocked on another device.");
+            }
+          }
+          if (index >= 0) next[field].splice(index, 1);
+          if (change.after) next[field].push(copyState(change.after));
+        }
+      }
+      return next;
+    }
+
+    function warnSavingError(error) {
+      console.error("Protected Firebase save failed:", error);
+      setFirebaseStatus("Save failed - refresh before editing", "error");
+      alert("Your change was NOT saved to Firebase. " + (error.message || error) +
+        "\n\nThe shared bookings have not been overwritten. Refresh to load the latest data.");
+    }
+
+    function saveState() {
+      if (!firebaseReady || !firebaseLoaded || !db) {
+        setFirebaseStatus("Not connected - changes disabled", "error");
+        alert("Firebase is not connected. Your changes were not saved. Please refresh when online.");
+        return;
+      }
+      const before = copyState(lastQueuedState);
+      const after = copyState(state);
+      const changes = makeChanges(before, after);
+      if (!changes.bookings.length && !changes.locks.length && !Object.keys(changes.resources).length) return;
+      lastQueuedState = after;
+      pendingWrites++;
+      setFirebaseStatus("Saving to Firebase...", "local");
+      saveQueue = saveQueue.then(async () => {
+        try {
+          if (!firebaseLoaded) throw new Error("A previous save failed. Refresh before making further changes.");
+          const docRef = db.doc(FIRESTORE_DOC_PATH);
+          await db.runTransaction(async transaction => {
+            const snap = await transaction.get(docRef);
+            if (!snap.exists) throw new Error("The booking database is missing. No new database was created.");
+            const oldData = snap.data();
+            const current = normaliseState(oldData);
+            const next = applyCheckedChanges(current, changes);
+            // A uniquely named, immutable, pre-change recovery snapshot per save.
+            // Kept in the same collection so existing collection-wide rules apply.
+            const historyRef = db.collection("powerhouseResourceBooking").doc(
+              HISTORY_PREFIX + Date.now() + "_" + Math.random().toString(36).slice(2, 10));
+            transaction.set(historyRef, {
+              resources: current.resources,
+              bookings: current.bookings,
+              locks: current.locks,
+              backedUpAt: firebase.firestore.FieldValue.serverTimestamp(),
+              sourceDocument: "main",
+              reason: "Before booking change"
+            });
+            transaction.update(docRef, {
+              resources: next.resources,
+              bookings: next.bookings,
+              locks: next.locks,
+              updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+            });
+          });
+          setFirebaseStatus("Firebase synced", "online");
+        } catch (error) {
+          firebaseLoaded = false; // Freeze further writes until reload.
+          warnSavingError(error);
+        } finally {
+          pendingWrites--;
+          if (pendingWrites === 0 && firebaseLoaded) {
+            try {
+              const fresh = await db.doc(FIRESTORE_DOC_PATH).get({ source: "server" });
+              if (fresh.exists) {
+                state = normaliseState(fresh.data());
+                lastQueuedState = copyState(state);
+                localStorage.setItem(LOCAL_KEY, JSON.stringify(state));
+                render();
+              }
+            } catch (error) {
+              firebaseLoaded = false;
+              warnSavingError(error);
+            }
+          }
+        }
+      }).catch(error => { firebaseLoaded = false; warnSavingError(error); });
+    }
+
+    function requireFirebase() {
+      if (firebaseReady && firebaseLoaded && db) return true;
+      alert("Bookings are temporarily read-only while Firebase connects or after a save error. Please refresh and try again.");
+      return false;
     }
 
     function initialiseFirebase() {
       if (!firebaseConfigIsFilled()) {
-        setFirebaseStatus("Local mode", "local");
+        setFirebaseStatus("Firebase not configured - read only", "error");
         return;
       }
-
       try {
         if (typeof firebase === "undefined") {
-          setFirebaseStatus("Firebase SDK not loaded", "error");
+          setFirebaseStatus("Firebase SDK not loaded - read only", "error");
           return;
         }
-
         firebase.initializeApp(firebaseConfig);
         db = firebase.firestore();
         firebaseReady = true;
-        setFirebaseStatus("Connecting to Firebase", "local");
-
-        unsubscribeRemote = db.doc(FIRESTORE_DOC_PATH).onSnapshot(async snapshot => {
-          if (!snapshot.exists) {
-            await db.doc(FIRESTORE_DOC_PATH).set({
-              resources: state.resources,
-              bookings: state.bookings,
-              locks: state.locks,
-              createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-              updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
+        setFirebaseStatus("Connecting to Firebase - read only", "local");
+        unsubscribeRemote = db.doc(FIRESTORE_DOC_PATH).onSnapshot({ includeMetadataChanges: true }, snapshot => {
+          // Do not initialise from cached / offline Firestore data.
+          if (snapshot.metadata.fromCache) {
+            if (!firebaseLoaded) setFirebaseStatus("Offline - changes disabled", "error");
             return;
           }
-
-          const remote = snapshot.data();
+          if (!snapshot.exists) {
+            firebaseLoaded = false;
+            setFirebaseStatus("Booking database missing - READ ONLY", "error");
+            alert("The main Firebase booking document is missing. For safety, this app will NOT recreate or overwrite it. Contact the administrator.");
+            return;
+          }
+          const remote = normaliseState(snapshot.data());
+          if (pendingWrites > 0) return; // Pending local edits are not overwritten by incoming snapshots.
           applyingRemoteUpdate = true;
-          state = normaliseState(remote);
-          localStorage.setItem("powerhouseResourceBookingV15", JSON.stringify(state));
+          state = remote;
+          lastQueuedState = copyState(remote);
+          localStorage.setItem(LOCAL_KEY, JSON.stringify(remote));
           applyingRemoteUpdate = false;
-
+          firebaseLoaded = true;
           if (!selectedResource || !getResources().includes(selectedResource)) {
             selectedResource = getResources()[0] || "";
           }
-
-          setFirebaseStatus("Firebase live", "online");
+          setFirebaseStatus("Firebase live - protected", "online");
           render();
         }, error => {
+          firebaseLoaded = false;
           console.error("Firebase listener error:", error);
-          setFirebaseStatus("Firebase connection error", "error");
+          setFirebaseStatus("Firebase connection error - read only", "error");
         });
       } catch (error) {
+        firebaseLoaded = false;
         console.error("Firebase init failed:", error);
-        setFirebaseStatus("Firebase setup error", "error");
+        setFirebaseStatus("Firebase setup error - read only", "error");
       }
     }
 
@@ -1388,6 +1545,7 @@
 
 
     function removeBookingById(id) {
+      if (!requireFirebase()) return;
       const booking = state.bookings.find(item => item.id === id);
       if (!booking) return;
 
@@ -1403,6 +1561,7 @@
     }
 
     function removeLockById(id) {
+      if (!requireFirebase()) return;
       const lock = state.locks.find(item => item.id === id);
       if (!lock) return;
       if (!confirm("Remove this unavailable block?")) return;
@@ -1613,6 +1772,7 @@
     }
 
     function saveBooking() {
+      if (!requireFirebase()) return;
       if (editingBookingId) return updateExistingBooking();
 
       const resource = document.getElementById("bookingResource").value;
@@ -1658,6 +1818,7 @@
     }
 
     function updateExistingBooking() {
+      if (!requireFirebase()) return;
       const booking = state.bookings.find(item => item.id === editingBookingId);
       if (!booking) return showBookingMessage("Booking not found. Please refresh and try again.", true);
 
@@ -1705,6 +1866,7 @@
     }
 
     function discardEditingBooking() {
+      if (!requireFirebase()) return;
       if (!editingBookingId) return;
       const booking = state.bookings.find(item => item.id === editingBookingId);
       if (!booking) return;
@@ -1728,6 +1890,7 @@
     }
 
     function cancelRecurringOccurrence(id, occurrenceDate) {
+      if (!requireFirebase()) return;
       const booking = state.bookings.find(item => item.id === id);
       if (!booking) return;
       if (!booking.cancelledDates) booking.cancelledDates = [];
@@ -1776,6 +1939,7 @@
     }
 
     function blockSelectedTime() {
+      if (!requireFirebase()) return;
       if (hasConflict(selectedResource, selectedStart, selectedEnd)) {
         alert("That time is already booked or unavailable.");
         return;
@@ -1892,6 +2056,7 @@
     }
 
     function addResource(type) {
+      if (!requireFirebase()) return;
       const input = document.getElementById(type === "rooms" ? "newRoomName" : "newVehicleName");
       const name = input.value.trim();
       if (!name) return alert("Enter a name first.");
@@ -1905,6 +2070,7 @@
     }
 
     function renameResource(type, index, newName) {
+      if (!requireFirebase()) return;
       newName = newName.trim();
       if (!newName) return alert("Name cannot be blank.");
       const oldName = state.resources[type][index];
@@ -1929,6 +2095,7 @@
     }
 
     function removeResource(type, index) {
+      if (!requireFirebase()) return;
       if (state.resources[type].length <= 1) return alert("You must keep at least one item.");
       const name = state.resources[type][index];
       if (!confirm("Remove " + name + "? This will also remove its bookings and blocked times.")) return;

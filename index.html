@@ -1076,15 +1076,33 @@
       return JSON.parse(JSON.stringify(data));
     }
 
+    // Firestore can return object fields in a different order from the local
+    // JavaScript objects. Compare canonical values, never JSON field order.
+    function canonicalValue(value) {
+      if (Array.isArray(value)) return value.map(canonicalValue);
+      if (value && typeof value === "object") {
+        const sorted = {};
+        Object.keys(value).sort().forEach(key => {
+          if (value[key] !== undefined) sorted[key] = canonicalValue(value[key]);
+        });
+        return sorted;
+      }
+      return value;
+    }
+
+    function signatureOf(value) {
+      return JSON.stringify(canonicalValue(value));
+    }
+
     // Older saved bookings may not have an ID. Match them by their exact
     // contents and duplicate occurrence, not their array position: removing
     // an earlier entry must never make later entries look like new bookings.
     function itemKey(item, index, list) {
       if (item && item.id != null && item.id !== "") return "id:" + String(item.id);
-      const signature = JSON.stringify(item);
+      const signature = signatureOf(item);
       let occurrence = 0;
       for (let i = 0; i < index; i++) {
-        if ((list[i].id == null || list[i].id === "") && JSON.stringify(list[i]) === signature) occurrence++;
+        if ((list[i].id == null || list[i].id === "") && signatureOf(list[i]) === signature) occurrence++;
       }
       return "legacy:" + signature + ":" + occurrence;
     }
@@ -1096,7 +1114,7 @@
         const newItems = new Map(after[field].map((item, index) => [itemKey(item, index, after[field]), item]));
         for (const [key, oldItem] of oldItems) {
           if (!newItems.has(key)) changes[field].push({ key, before: oldItem, after: null });
-          else if (JSON.stringify(oldItem) !== JSON.stringify(newItems.get(key))) {
+          else if (!isSame(oldItem, newItems.get(key))) {
             changes[field].push({ key, before: oldItem, after: newItems.get(key) });
           }
         }
@@ -1105,14 +1123,14 @@
         }
       }
       for (const type of ["rooms", "vehicles"]) {
-        if (JSON.stringify(before.resources[type]) !== JSON.stringify(after.resources[type])) {
+        if (!isSame(before.resources[type], after.resources[type])) {
           changes.resources[type] = { before: before.resources[type], after: after.resources[type] };
         }
       }
       return changes;
     }
 
-    function isSame(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+    function isSame(a, b) { return signatureOf(a) === signatureOf(b); }
 
     function proposedBookingClashes(item, remote, exceptId) {
       if (!item || !item.resource || !item.start || !item.end || !item.date) return false;
